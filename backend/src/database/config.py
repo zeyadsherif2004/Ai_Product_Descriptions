@@ -36,6 +36,12 @@ def get_database_url() -> str:
     # Check for explicit DATABASE_URL first
     database_url = os.getenv("DATABASE_URL")
     if database_url:
+        # Ensure SSL mode is set for PostgreSQL (required by Render and most cloud providers)
+        if 'postgresql' in database_url and 'sslmode' not in database_url:
+            if '?' in database_url:
+                database_url += '&sslmode=require'
+            else:
+                database_url += '?sslmode=require'
         return database_url
     
     # Build URL from individual components
@@ -49,9 +55,13 @@ def get_database_url() -> str:
     # Handle different database types
     if db_type == "postgresql":
         if db_password:
-            return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+            url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
         else:
-            return f"postgresql://{db_user}@{db_host}:{db_port}/{db_name}"
+            url = f"postgresql://{db_user}@{db_host}:{db_port}/{db_name}"
+        # Add SSL mode for non-localhost PostgreSQL
+        if db_host != "localhost" and db_host != "127.0.0.1":
+            url += "?sslmode=require"
+        return url
     elif db_type == "sqlite":
         return f"sqlite:///{db_name}.db"
     elif db_type == "mysql":

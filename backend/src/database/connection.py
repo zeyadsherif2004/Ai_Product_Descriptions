@@ -35,6 +35,7 @@ def get_engine() -> Engine:
             "max_overflow": config.max_overflow,
             "pool_timeout": config.pool_timeout,
             "pool_recycle": config.pool_recycle,
+            "pool_pre_ping": True,  # Verify connections before using
         }
         
         # SQLite specific configuration
@@ -45,17 +46,23 @@ def get_engine() -> Engine:
                 "connect_args": {"check_same_thread": False}
             }
         
-        # SSL configuration for PostgreSQL
-        if config.url.startswith("postgresql") and config.ssl_mode:
-            ssl_args = {"sslmode": config.ssl_mode}
+        # PostgreSQL specific configuration
+        elif config.url.startswith("postgresql"):
+            # Always add SSL mode for cloud databases
+            connect_args = {
+                "connect_timeout": 10,  # 10 second connection timeout
+            }
+            # Add SSL args if specified in config
+            if config.ssl_mode:
+                connect_args["sslmode"] = config.ssl_mode
             if config.ssl_cert:
-                ssl_args["sslcert"] = config.ssl_cert
+                connect_args["sslcert"] = config.ssl_cert
             if config.ssl_key:
-                ssl_args["sslkey"] = config.ssl_key
+                connect_args["sslkey"] = config.ssl_key
             if config.ssl_root_cert:
-                ssl_args["sslrootcert"] = config.ssl_root_cert
+                connect_args["sslrootcert"] = config.ssl_root_cert
             
-            engine_kwargs["connect_args"] = ssl_args
+            engine_kwargs["connect_args"] = connect_args
         
         _engine = create_engine(config.url, **engine_kwargs)
         logger.info(f"Database engine created for: {config.url.split('@')[-1] if '@' in config.url else config.url}")

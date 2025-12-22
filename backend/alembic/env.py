@@ -21,10 +21,17 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 def get_url():
-    return os.getenv(
+    url = os.getenv(
         "DATABASE_URL",
         "postgresql+psycopg://postgres:postgres@localhost:5432/ai_descriptions",
     )
+    # Ensure SSL mode is set for PostgreSQL (required by Render and most cloud providers)
+    if 'postgresql' in url and 'sslmode' not in url:
+        if '?' in url:
+            url += '&sslmode=require'
+        else:
+            url += '?sslmode=require'
+    return url
 
 
 def run_migrations_offline() -> None:

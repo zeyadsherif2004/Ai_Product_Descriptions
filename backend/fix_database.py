@@ -22,6 +22,14 @@ def get_database_url():
                 print(f"  {key}: {value[:50]}...")
         return None
     
+    # Ensure SSL mode is set for PostgreSQL (required by Render)
+    if 'postgresql' in db_url and 'sslmode' not in db_url:
+        if '?' in db_url:
+            db_url += '&sslmode=require'
+        else:
+            db_url += '?sslmode=require'
+        print("🔒 Added sslmode=require for Render PostgreSQL")
+    
     print(f"✅ Found database URL: {db_url[:50]}...")
     return db_url
 
@@ -119,9 +127,16 @@ def main():
     if not db_url:
         sys.exit(1)
     
-    # Create engine
+    # Create engine with proper configuration for Render
     try:
-        engine = create_engine(db_url)
+        engine = create_engine(
+            db_url,
+            pool_pre_ping=True,  # Verify connection before using
+            pool_recycle=300,    # Recycle connections after 5 minutes
+            connect_args={
+                "connect_timeout": 10,  # 10 second connection timeout
+            }
+        )
         print("✅ Database connection established")
     except Exception as e:
         print(f"❌ Failed to connect to database: {e}")
