@@ -8,7 +8,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, WebSocket, WebSocketDisconnect, Request
 from sqlalchemy.orm import Session
 from src.database.deps import get_db
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +17,11 @@ import pandas as pd
 import json
 import io
 from dotenv import load_dotenv
+
+# Rate limiting imports
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 try:
     import sentry_sdk
@@ -60,12 +65,19 @@ def setup_logging():
 
 setup_logging()
 
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
 # Initialize FastAPI app
 app = FastAPI(
     title="AI Product Descriptions API",
     description="API for generating AI-powered product descriptions",
     version="1.0.0"
 )
+
+# Add rate limiting exception handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Add CORS middleware (env-driven)
 cors_origins_env = os.getenv(
@@ -220,28 +232,13 @@ async def startup_event():
         try:
             from src.payments.init_subscription_plans import init_subscription_plans
             init_subscription_plans()
-            print("📋 Subscription plans initialized")
+            logging.info("Subscription plans initialized")
         except Exception as e:
-            print(f"⚠️  Warning: Failed to initialize subscription plans: {str(e)}")
+            logging.warning(f"Failed to initialize subscription plans: {str(e)}")
         
     except Exception as e:
-        print(f"❌ Failed to start API: {str(e)}")
+        logging.error(f"Failed to start API: {str(e)}")
         raise
-
-# TEMPORARILY DISABLED FOR TESTING
-def rate_limit_api_call():
-    """Ensure minimum interval between API calls to avoid rate limiting"""
-    # global last_api_call_time
-    # current_time = time.time()
-    # time_since_last_call = current_time - last_api_call_time
-    # 
-    # if time_since_last_call < MIN_API_INTERVAL:
-    #     sleep_time = MIN_API_INTERVAL - time_since_last_call
-    #     logging.info(f"Rate limiting: sleeping for {sleep_time:.2f} seconds")
-    #     time.sleep(sleep_time)
-    # 
-    # last_api_call_time = time.time()
-    pass
 
 @app.get("/api/health")
 async def health_check():
@@ -278,8 +275,9 @@ async def auth_me(user = Depends(get_current_user)):
     return {"user": safe}
 
 @app.get("/api/test-language/{language_code}")
-async def test_language_generation(language_code: str):
-    """Test endpoint to debug language generation issues"""
+@limiter.limit("5/minute")
+def test_language_generation(request: Request, language_code: str, user = Depends(get_current_user)):
+    """Test endpoint to debug language generation issues (requires authentication)"""
     if model is None:
         raise HTTPException(status_code=500, detail="AI model not initialized")
     
@@ -311,17 +309,13 @@ Return JSON:
 }}"""
         
         logging.info(f"Testing language generation for: {language_code}")
-        logging.info(f"Test prompt: {test_prompt}")
         
-        # TEMPORARILY DISABLED FOR TESTING - rate_limit_api_call()  # Add rate limiting
         ai_text, tokens_used, response_time = call_gemini_generate(
             model=model,
             prompt=test_prompt,
-            temperature=0.8,  # Increased for more creative and persuasive content
+            temperature=0.8,
             cost_tracker=cost_tracker
         )
-        
-        logging.info(f"AI response: {ai_text}")
         
         # Try to parse the response
         ai_text = safety_filter.sanitize_output(ai_text)
@@ -362,7 +356,9 @@ Return JSON:
         }
 
 @app.post("/api/generate-description")
-async def generate_description(
+@limiter.limit("30/minute")
+def generate_description(
+    request: Request,
     title: str = Form(...),
     features: str = Form(...),
     category: str = Form("generic"),
@@ -371,7 +367,7 @@ async def generate_description(
     sku: str = Form(""),
     languageCode: str = Form("en"),
     user = Depends(get_current_user),
-    db: Session = Depends(get_db)  # ✅ Add missing DB session injection
+    db: Session = Depends(get_db)
 ):
     """Generate a single product description"""
     if model is None or credit_service is None:
@@ -379,14 +375,19 @@ async def generate_description(
     
     user_id = user.get("uid")
     
-    # Check and refresh credits if needed
-    await credit_service.check_and_refresh_credits(user_id, session=db)  # ✅ Add missing session parameter
-    
-    # Check user credits before generation
-    operation_type = OperationType.SINGLE_DESCRIPTION
-    can_proceed, credit_info = await credit_service.check_credits_and_limits(
-        user_id, operation_type, product_count=1, session=db  # ✅ Add missing session parameter
-    )
+    # Check and refresh credits if needed (run sync version)
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(credit_service.check_and_refresh_credits(user_id, session=db))
+        
+        # Check user credits before generation
+        operation_type = OperationType.SINGLE_DESCRIPTION
+        can_proceed, credit_info = loop.run_until_complete(credit_service.check_credits_and_limits(
+            user_id, operation_type, product_count=1, session=db
+        ))
+    finally:
+        loop.close()
     
     if not can_proceed:
         raise HTTPException(
@@ -480,9 +481,13 @@ async def generate_description(
         seo = seo_evaluate(description, primary_keyword)
         
         # Deduct credits after successful generation
-        deduct_success, deduct_result = await credit_service.deduct_credits(
-            user_id, operation_type, product_count=1, request_id=row["id"], session=db
-        )
+        loop = asyncio.new_event_loop()
+        try:
+            deduct_success, deduct_result = loop.run_until_complete(credit_service.deduct_credits(
+                user_id, operation_type, product_count=1, request_id=row["id"], session=db
+            ))
+        finally:
+            loop.close()
         if not deduct_success:
             logging.warning(f"Failed to deduct credits for user {user_id}: {deduct_result.get('error')}")
         
@@ -513,16 +518,22 @@ async def generate_description(
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 @app.post("/api/generate-batch")
-async def generate_batch_json(request: Dict[str, Any], user = Depends(get_current_user), db: Session = Depends(get_db)):  # ✅ Add missing DB session injection
+@limiter.limit("10/minute")
+def generate_batch_json(http_request: Request, request: Dict[str, Any], user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Generate descriptions for multiple products from batch request"""
-    logging.info(f"🚀 Generate batch endpoint called - user: {user.get('email', 'unknown')}")
+    logging.info(f"Generate batch endpoint called - user: {user.get('email', 'unknown')}")
     if model is None or credit_service is None:
         raise HTTPException(status_code=500, detail="AI model or credit service not initialized")
     
     user_id = user.get("uid")
     
-    # Check and refresh credits if needed
-    await credit_service.check_and_refresh_credits(user_id, session=db)  # ✅ Add missing session parameter
+    # Check and refresh credits if needed (run sync)
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(credit_service.check_and_refresh_credits(user_id, session=db))
+    finally:
+        loop.close()
     
     # Handle both old format (array of products) and new format (batch request)
     if isinstance(request, list):
@@ -547,9 +558,13 @@ async def generate_batch_json(request: Dict[str, Any], user = Depends(get_curren
     product_count = len(products)
     operation_type = credit_service.determine_operation_type(product_count, is_regeneration=False)
     
-    can_proceed, credit_info = await credit_service.check_credits_and_limits(
-        user_id, operation_type, product_count, session=db
-    )
+    loop = asyncio.new_event_loop()
+    try:
+        can_proceed, credit_info = loop.run_until_complete(credit_service.check_credits_and_limits(
+            user_id, operation_type, product_count, session=db
+        ))
+    finally:
+        loop.close()
     
     if not can_proceed:
         raise HTTPException(
@@ -814,11 +829,6 @@ Return JSON:
                 
                 results.append(result)
                 
-                # TEMPORARILY DISABLED FOR TESTING - Add delay between API calls to avoid rate limits
-                # if idx < len(products) - 1:  # Don't delay after the last item
-                #     import time
-                #     time.sleep(2)
-                
             except Exception as e:
                 errors.append({
                     "row": idx,
@@ -828,9 +838,13 @@ Return JSON:
         
         # Deduct credits after successful batch generation
         batch_id = f"batch_{timestamp()}"
-        deduct_success, deduct_result = await credit_service.deduct_credits(
-            user_id, operation_type, product_count, batch_id=batch_id, session=db
-        )
+        loop = asyncio.new_event_loop()
+        try:
+            deduct_success, deduct_result = loop.run_until_complete(credit_service.deduct_credits(
+                user_id, operation_type, product_count, batch_id=batch_id, session=db
+            ))
+        finally:
+            loop.close()
         if not deduct_success:
             logging.warning(f"Failed to deduct credits for user {user_id}: {deduct_result.get('error')}")
         
@@ -854,7 +868,8 @@ Return JSON:
         raise HTTPException(status_code=500, detail=f"JSON batch processing failed: {str(e)}")
 
 @app.post("/api/generate-batch-csv")
-async def generate_batch(file: UploadFile = File(...), audience: str = Form(...), languageCode: str = Form("en"), user = Depends(get_current_user), db: Session = Depends(get_db)):  # ✅ Add missing DB session injection
+@limiter.limit("5/minute")
+async def generate_batch(http_request: Request, file: UploadFile = File(...), audience: str = Form(...), languageCode: str = Form("en"), user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Generate descriptions for multiple products from CSV with automatic column mapping"""
     if model is None or credit_service is None:
         raise HTTPException(status_code=500, detail="AI model or credit service not initialized")
@@ -862,7 +877,7 @@ async def generate_batch(file: UploadFile = File(...), audience: str = Form(...)
     user_id = user.get("uid")
     
     # Check and refresh credits if needed
-    await credit_service.check_and_refresh_credits(user_id, session=db)  # ✅ Add missing session parameter
+    await credit_service.check_and_refresh_credits(user_id, session=db)
     
     # Validate language code
     SUPPORTED_LANGUAGES = ['en', 'es', 'fr', 'de', 'ja', 'zh']
@@ -1001,7 +1016,7 @@ async def generate_batch(file: UploadFile = File(...), audience: str = Form(...)
         # Deduct credits after successful CSV batch generation
         batch_id = f"batch_{timestamp()}"
         deduct_success, deduct_result = await credit_service.deduct_credits(
-            user_id, operation_type, product_count, batch_id=batch_id
+            user_id, operation_type, product_count, batch_id=batch_id, session=db
         )
         if not deduct_success:
             logging.warning(f"Failed to deduct credits for user {user_id}: {deduct_result.get('error')}")
@@ -1085,9 +1100,10 @@ async def download_batch(batch_id: str):
     )
 
 @app.post("/api/regenerate")
-async def regenerate_description(item: Dict[str, Any], user = Depends(get_current_user)):
+@limiter.limit("30/minute")
+def regenerate_description(http_request: Request, item: Dict[str, Any], user = Depends(get_current_user)):
     """Regenerate a single product description"""
-    logging.info(f"🔄 Regenerate endpoint called - user: {user.get('email', 'unknown')}")
+    logging.info(f"Regenerate endpoint called - user: {user.get('email', 'unknown')}")
     if model is None or credit_service is None:
         raise HTTPException(status_code=500, detail="AI model or credit service not initialized")
     
@@ -1096,14 +1112,19 @@ async def regenerate_description(item: Dict[str, Any], user = Depends(get_curren
     
     user_id = user.get("uid")
     
-    # Check and refresh credits if needed
-    await credit_service.check_and_refresh_credits(user_id)
-    
-    # Check credits for regeneration (1 credit)
-    operation_type = OperationType.REGENERATION
-    can_proceed, credit_info = await credit_service.check_credits_and_limits(
-        user_id, operation_type, product_count=1
-    )
+    # Check and refresh credits if needed (run sync)
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(credit_service.check_and_refresh_credits(user_id))
+        
+        # Check credits for regeneration (1 credit)
+        operation_type = OperationType.REGENERATION
+        can_proceed, credit_info = loop.run_until_complete(credit_service.check_credits_and_limits(
+            user_id, operation_type, product_count=1
+        ))
+    finally:
+        loop.close()
     
     if not can_proceed:
         raise HTTPException(
@@ -1188,9 +1209,13 @@ async def regenerate_description(item: Dict[str, Any], user = Depends(get_curren
                 raise HTTPException(status_code=500, detail=f"Regenerate description failed compliance validation: {validation_error}")
         
         # Deduct credits after successful regeneration
-        deduct_success, deduct_result = await credit_service.deduct_credits(
-            user_id, operation_type, product_count=1, request_id=row_dict["id"]
-        )
+        loop = asyncio.new_event_loop()
+        try:
+            deduct_success, deduct_result = loop.run_until_complete(credit_service.deduct_credits(
+                user_id, operation_type, product_count=1, request_id=row_dict["id"]
+            ))
+        finally:
+            loop.close()
         if not deduct_success:
             logging.warning(f"Failed to deduct credits for user {user_id}: {deduct_result.get('error')}")
         

@@ -11,32 +11,13 @@ export const api = axios.create({ baseURL: API_BASE, timeout: 300000, headers: {
 api.interceptors.request.use(async (config) => {
   const token = await getIdToken();
   if (token) {
-    // Debug: Verify token format
-    const segments = token.split('.');
-    if (segments.length !== 3) {
-      console.error('❌ INVALID TOKEN FORMAT:', {
-        length: token.length,
-        segments: segments.length,
-        preview: token.substring(0, 50) + '...'
-      });
-    } else {
-      console.log('✅ VALID TOKEN FORMAT:', {
-        length: token.length,
-        segments: segments.length,
-        preview: token.substring(0, 50) + '...'
-      });
-    }
     config.headers.Authorization = `Bearer ${token}`;
   } else {
-    console.warn('⚠️ No auth token available for request, retrying...');
     // Add a small delay and retry once to handle race conditions
     await new Promise(resolve => setTimeout(resolve, 100));
     const retryToken = await getIdToken();
     if (retryToken) {
-      console.log('✅ Token retrieved on retry');
       config.headers.Authorization = `Bearer ${retryToken}`;
-    } else {
-      console.error('❌ Still no token available after retry');
     }
   }
   return config;
@@ -46,13 +27,13 @@ api.interceptors.request.use(async (config) => {
 export function handleApiError(error: unknown): string {
   if (axios.isAxiosError(error)) {
     const axiosError = error as AxiosError;
-    
+
     if (axiosError.response?.status === 429) {
       const retryAfter = axiosError.response.headers['retry-after'];
       const seconds = retryAfter ? parseInt(retryAfter) : 60;
       return `Rate limit exceeded. Please wait ${seconds} seconds before trying again.`;
     }
-    
+
     if (axiosError.response?.status === 400) {
       const errorData = axiosError.response.data as any;
       if (errorData?.error_code === 'INSUFFICIENT_CREDITS') {
@@ -66,15 +47,15 @@ export function handleApiError(error: unknown): string {
       }
       return "Invalid request. Please check your input and try again.";
     }
-    
+
     if (axiosError.response?.status === 401) {
       return "Authentication required. Please sign in and try again.";
     }
-    
+
     if (axiosError.response?.status === 402) {
       return "Payment required. Please upgrade your plan or purchase credits to continue.";
     }
-    
+
     if (axiosError.response?.status === 403) {
       const errorData = axiosError.response.data as any;
       if (errorData?.error_code === 'CREDIT_LIMIT_EXCEEDED') {
@@ -82,16 +63,16 @@ export function handleApiError(error: unknown): string {
       }
       return "Access denied. Please check your subscription status.";
     }
-    
+
     if (axiosError.response?.status === 500) {
       return "Server error. Please try again later.";
     }
-    
+
     if (axiosError.code === 'ECONNABORTED') {
       return "Request timed out. Please try again.";
     }
   }
-  
+
   return error instanceof Error ? error.message : "An unexpected error occurred.";
 }
 
@@ -136,12 +117,7 @@ export const paymentApi = {
       success_url: successUrl,
       cancel_url: cancelUrl
     });
-    console.log("=== API CLIENT DEBUG ===");
-    console.log("Full axios response:", response);
-    console.log("Response data:", response.data);
-    console.log("Response data type:", typeof response.data);
-    console.log("Response data keys:", Object.keys(response.data || {}));
-    
+
     // Backend returns checkout data directly, not wrapped in 'data' property
     return response.data;
   },
